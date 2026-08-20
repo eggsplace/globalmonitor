@@ -236,15 +236,32 @@
                 <span id="total-events-count" style="color: var(--accent-cyan);">0 ACTIVE</span>
             </div>
             <div class="filter-tabs">
-                <button class="filter-btn active" onclick="filterEvents('all')">ALL</button>
-                <button class="filter-btn" onclick="filterEvents('seismic')">SEISMIC</button>
-                <button class="filter-btn" onclick="filterEvents('conflict')">INTEL</button>
+                <button class="filter-btn active" onclick="filterEvents('all', this)">ALL</button>
+                <button class="filter-btn" onclick="filterEvents('seismic', this)">SEISMIC</button>
+                <button class="filter-btn" onclick="filterEvents('conflict', this)">INTEL</button>
             </div>
+
+            <!-- Radar controls: toggle + last-update -->
+            <div class="radar-controls" style="padding:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;">
+                <button id="radar-toggle" class="filter-btn" onclick="toggleRadarUI()">RADAR</button>
+                <span id="radar-status" style="color: var(--text-dim); font-size:11px;">last: N/A</span>
+            </div>
+
+            <!-- Satellite (NASA GIBS) controls: date selector + toggle -->
+            <div class="sat-controls" style="padding:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;">
+                <button id="sat-toggle" class="filter-btn" onclick="toggleGIBS()">SAT</button>
+                <input type="date" id="sat-date" style="background:transparent;color:var(--text-main);border:1px solid var(--border);padding:4px;font-size:11px;">
+                <span id="sat-status" style="color: var(--text-dim); font-size:11px;">date</span>
+            </div>
+
             <div class="events-list" id="events-feed">
                 <div style="padding: 12px; color: var(--text-dim); text-align: center;">Fetching telemetry data...</div>
             </div>
         </aside>
     </div>
+
+    <!-- Load radar.js (must come before main inline script so UI can call functions) -->
+    <script src="radar.js"></script>
 
     <script>
         // 1. Clock Tracker
@@ -263,7 +280,7 @@
         });
 
         // Use CartoDB Dark Matter for the tactical dark theme
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        const darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
             attribution: '&copy; CARTO, OpenStreetMap contributors',
             maxZoom: 19,
             subdomains: 'abcd'
@@ -271,6 +288,9 @@
 
         let eventMarkers = [];
         let allEvents = [];
+
+        // GIBS satellite layer variable
+        let gibsLayer = null;
 
         // 3. Fetch Live Earthquakes (USGS GeoJSON)
         async function fetchSeismicData() {
@@ -333,9 +353,9 @@
         }
 
         // Filter Handlers
-        window.filterEvents = function(type) {
+        window.filterEvents = function(type, btn) {
             document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-            event.target.classList.add('active');
+            if (btn && btn.classList) btn.classList.add('active');
 
             if (type === 'all') {
                 renderEvents(allEvents);
@@ -344,12 +364,146 @@
             }
         };
 
+        // Radar UI helpers
+        async function updateRadarStatus() {
+            try {
+                const res = await fetch('https://api.rainviewer.com/public/weather-maps.json');
+                if (!res.ok) throw new Error('network');
+                const data = await res.json();
+                if (data && data.radar && data.radar.past && data.radar.past.length) {
+                    const latest = data.radar.past[data.radar.past.length - 1].time;
+                    const d = new Date(latest * 1000);
+                    document.getElementById('radar-status').innerText = `last: ${d.toUTCString()}`;
+                } else {
+                    document.getElementById('radar-status').innerText = 'last: N/A';
+                }
+            } catch (err) {
+                document.getElementById('radar-status').innerText = 'last: error';
+            }
+        }
+
+        function setRadarButtonState(enabled) {
+            const btn = document.getElementById('radar-toggle');
+            if (!btn) return;
+            if (enabled) {
+                btn.classList.add('active');
+                btn.innerText = 'RADAR ON';
+            } else {
+                btn.classList.remove('active');
+                btn.innerText = 'RADAR';
+            }
+        }
+
+        function toggleRadarUI() {
+            // toggleWeatherRadar is provided by radar.js
+            if (typeof toggleWeatherRadar !== 'function') {
+                console.warn('radar.js not loaded');
+                return;
+            }
+            // If radarLayer exists (in radar.js) we can't inspect it here, so track by button state
+            const btn = document.getElementById('radar-toggle');
+            const enabled = btn.classList.contains('active');
+            if (enabled) {
+                removeWeatherRadar();
+                setRadarButtonState(false);
+            } else {
+                addWeatherRadar();
+                setRadarButtonState(true);
+                // update status immediately
+                updateRadarStatus();
+            }
+        }
+
+        // NASA GIBS helpers
+        function formatDateToYYYYMMDD(d) {
+            const y = d.getUTCFullYear();
+            const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+            const day = String(d.getUTCDate()).padStart(2, '0');
+            return `${y}-${m}-${day}`;
+        }
+
+        function getDefaultGIBSDate() {
+            // GIBS tiles are available for recent dates; default to today (UTC)
+            return formatDateToYYYYMMDD(new Date());
+        }
+
+        function gibsTileUrlForDate(dateStr) {
+            // VIIRS True Color, GoogleMapsCompatible_Level9
+            return `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/${dateStr}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`;
+        }
+
+        function addGIBS(dateStr) {
+            try {
+                const url = gibsTileUrlForDate(dateStr);
+                if (gibsLayer) {
+                    // update URL
+                    gibsLayer.setUrl(url);
+                    console.log('GIBS: updated to', dateStr);
+                    document.getElementById('sat-status').innerText = dateStr;
+                    return;
+                }
+                gibsLayer = L.tileLayer(url, { attribution: 'NASA GIBS', opacity: 0.7, zIndex: 400 });
+                gibsLayer.addTo(map);
+                document.getElementById('sat-status').innerText = dateStr;
+                console.log('GIBS: added', dateStr);
+            } catch (err) {
+                console.error('Failed to add GIBS layer:', err);
+            }
+        }
+
+        function removeGIBS() {
+            if (gibsLayer) {
+                map.removeLayer(gibsLayer);
+                gibsLayer = null;
+                document.getElementById('sat-status').innerText = 'off';
+            }
+        }
+
+        function toggleGIBS() {
+            const btn = document.getElementById('sat-toggle');
+            const enabled = btn.classList.contains('active');
+            if (enabled) {
+                removeGIBS();
+                btn.classList.remove('active');
+                btn.innerText = 'SAT';
+            } else {
+                const dateInput = document.getElementById('sat-date');
+                const date = dateInput && dateInput.value ? dateInput.value : getDefaultGIBSDate();
+                addGIBS(date);
+                btn.classList.add('active');
+                btn.innerText = 'SAT ON';
+            }
+        }
+
+        // Wire up date input change to update GIBS layer when toggled on
+        function initGIBSControls() {
+            const dateInput = document.getElementById('sat-date');
+            const defaultDate = getDefaultGIBSDate();
+            if (dateInput) {
+                dateInput.value = defaultDate;
+                dateInput.max = defaultDate;
+                dateInput.addEventListener('change', () => {
+                    const dateVal = dateInput.value;
+                    document.getElementById('sat-status').innerText = dateVal;
+                    if (gibsLayer) addGIBS(dateVal);
+                });
+            }
+        }
+
         // Initialize Feeds
         async function init() {
             const seismic = await fetchSeismicData();
             allEvents = [...seismic];
             renderEvents(allEvents);
             document.getElementById('feed-count').innerText = 'ONLINE';
+
+            // Start radar auto-refresh (5 minutes) and status updater
+            if (typeof startRadarAutoRefresh === 'function') startRadarAutoRefresh(300000);
+            updateRadarStatus();
+            setInterval(updateRadarStatus, 60000);
+
+            // Init GIBS controls and set default date
+            initGIBSControls();
         }
 
         init();
